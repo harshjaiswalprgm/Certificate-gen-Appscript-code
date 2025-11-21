@@ -1,0 +1,155 @@
+/////////////////////////////////////////////////////////////////////////////////////
+// 1. Placement Certificate Verification API
+/////////////////////////////////////////////////////////////////////////////////////
+function doGet(e) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+
+  const id = e?.parameter?.id?.trim();
+  let result;
+
+  if (!id) {
+    result = {
+      valid: false,
+      message: "No Certificate ID provided",
+    };
+  } else {
+    const data = sheet.getDataRange().getValues();
+    result = { valid: false, message: "Certificate not found" };
+
+    for (let i = 1; i < data.length; i++) {
+      const row = data[i];
+      const certId = row[2]?.toString().trim();
+
+      if (certId === id) {
+        result = {
+          valid: true,
+          name: row[0],
+          issueDate: row[1],
+          certificateId: row[2],
+          certificateLink: row[3],
+          email: row[4] || "",
+        };
+        break;
+      }
+    }
+  }
+
+  return ContentService
+    .createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+// 2. Generate Placement Certificates
+/////////////////////////////////////////////////////////////////////////////////////
+function generatePlacementCertificates() {
+  const templateId = "1Id3IaUMbbsr-CHzMbcz6mHGWD9Kv0Qvp61IqTFwFraU";
+  const folderId = "1unNd7MYTo8cfq5Ksql9_8rAG38ZHTc7L";
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+  const data = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < data.length; i++) {
+
+    const name = data[i][0];
+    const issueDateRaw = data[i][1];
+    const certId = data[i][2];
+    const certLink = data[i][3] || "";
+    const email = data[i][4] || "";
+    const status = (data[i][5] || "").toString();
+
+    if (!name || !issueDateRaw || !certId) continue;
+
+    if (status === "Generated" || status === "Email Sent") continue;
+    if (certLink.startsWith("https://")) continue;
+
+    try {
+      const folder = DriveApp.getFolderById(folderId);
+
+      const issueDate = issueDateRaw instanceof Date
+        ? Utilities.formatDate(issueDateRaw, Session.getScriptTimeZone(), "dd MMM yyyy")
+        : issueDateRaw;
+
+      const template = DriveApp.getFileById(templateId);
+      const copy = template.makeCopy(`Placement_${certId}_${name}`);
+      const copyId = copy.getId();
+      const slide = SlidesApp.openById(copyId);3
+      const slides = slide.getSlides();
+
+      slides.forEach(s => {
+        s.replaceAllText("{{Name}}", name);
+        s.replaceAllText("{{IssueDate}}", issueDate);
+        s.replaceAllText("{{CertificateID}}", certId);
+      });
+
+      const verifyURL = `https://www.glowlogics.in/placement-verification?id=${encodeURIComponent(certId)}`;
+      const qrURL = `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(verifyURL)}`;
+      const qrBlob = UrlFetchApp.fetch(qrURL).getBlob();
+
+      slides[0].insertImage(qrBlob)
+        .setLeft(80)
+        .setTop(480)
+        .setWidth(60)
+        .setHeight(60);
+
+      slide.saveAndClose();
+
+      const pdf = DriveApp.getFileById(copyId)
+        .getAs("application/pdf")
+        .setName(`Placement_Certificate_${name}.pdf`);
+
+      const pdfFile = folder.createFile(pdf);
+      pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+      sheet.getRange(i + 1, 4).setValue(pdfFile.getUrl());
+      sheet.getRange(i + 1, 6).setValue("Generated");
+
+      DriveApp.getFileById(copyId).setTrashed(true);
+
+    } catch (err) {
+      Logger.log(`Error generating certificate for ${name}: ${err.message}`);
+      sheet.getRange(i + 1, 6).setValue("Error");
+    }
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("All Placement Certificates Generated!");
+}
+
+/////////////////////////////////////////////////////////////////////////////////////
+// 3. Send Email
+/////////////////////////////////////////////////////////////////////////////////////
+function sendPlacementEmails() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+  const data = sheet.getDataRange().getValues();
+
+  for (let i = 1; i < data.length; i++) {
+
+    const name = data[i][0];
+    const certId = data[i][2];
+    const certLink = data[i][3];
+    const email = data[i][4];
+    const status = (data[i][5] || "").toString();
+
+    if (!email) continue;
+    if (!certLink.startsWith("https://")) continue;
+    if (status === "Email Sent") continue;
+
+    const subject = "Your Placement Certificate - Glowlogics";
+    const body = `
+      <p>Dear <b>${name}</b>,</p>
+      <p>Your <b>Placement Certificate</b> is ready.</p>
+      <p>Download here: <a href="${certLink}">Click here</a></p>
+      <p>Certificate ID: ${certId}</p>
+      <br>
+      <p>- Glowlogics</p>
+    `;
+
+    try {
+      GmailApp.sendEmail(email, subject, "", { htmlBody: body });
+      sheet.getRange(i + 1, 6).setValue("Email Sent");
+
+    } catch (err) {
+      sheet.getRange(i + 1, 6).setValue("Email Failed");
+    }
+  }
+}

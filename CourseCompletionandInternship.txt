@@ -1,0 +1,275 @@
+function doGet(e) {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+
+  // FIX: Read only A to K (11 cols) exactly
+  const lastRow = sheet.getLastRow();
+  const data = sheet.getRange(1, 1, lastRow, 11).getValues();
+
+  const id = e?.parameter?.id?.toString().trim();
+
+  if (!id) {
+    return ContentService.createTextOutput(JSON.stringify({
+      valid: false,
+      message: "No ID provided"
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  let result = { valid: false, message: "Certificate not found" };
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+
+    const internshipID = row[0]?.toString().trim();
+    const courseID = row[1]?.toString().trim();
+
+    if (internshipID === id || courseID === id) {
+
+      result = {
+        valid: true,
+        internshipId: internshipID,
+        courseCompletionId: courseID,
+        name: row[2],
+        course: row[3],
+        issueDate: row[4],
+        internshipLink: row[5],
+        courseCompletionLink: row[6],
+        phone: row[7],
+        email: row[8],
+        batch: row[9],
+        status: row[10]
+      };
+
+      break;
+    }
+  }
+
+  return ContentService.createTextOutput(JSON.stringify(result))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+
+
+function generateCertificates() {
+  const internshipTemplate = "1FAbx4e2Ophkb0qkg-oIqwNnqfLHWKUrOv4ebKtHtQMc";
+  const courseTemplate = "1RYWyfINkper38eqyN0GZQ0aymi8axz5QvYNj0PtQniQ";
+  const folderId = "1hTU6uTxRA-gCLWuGJKfD6Af2fZFFfmYm";
+
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+  const data = sheet.getDataRange().getValues();
+
+  Logger.log("STARTING CERTIFICATE GENERATION...");
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+
+    const internshipId = row[0]?.toString().trim();
+    const courseId = row[1]?.toString().trim();
+    const name = row[2]?.toString().trim();
+    const course = row[3]?.toString().trim();
+    const issueDateRaw = row[4];
+    const internshipLink = row[5];
+    const courseLink = row[6];
+    const email = row[8]?.toString().trim();
+    const status = (row[10] || "").toString().toLowerCase();
+
+    if (!internshipId || !courseId || !name || !course || !issueDateRaw || !email) {
+      Logger.log(`⚠️ Row ${i + 1}: Missing fields`);
+      continue;
+    }
+
+    const folder = DriveApp.getFolderById(folderId);
+
+    const issueDate = issueDateRaw instanceof Date
+      ? Utilities.formatDate(issueDateRaw, Session.getScriptTimeZone(), "dd MMM yyyy")
+      : issueDateRaw;
+
+    const certs = [
+      {
+        type: "Internship",
+        id: internshipId,
+        template: internshipTemplate,
+        linkCol: 6,
+        existing: internshipLink,
+        placeholderKey: "{{InternshipID}}",
+        qrLeft: 730,
+        qrTop: 480,
+        qrSize: 70
+      },
+      {
+        type: "Course Completion",
+        id: courseId,
+        template: courseTemplate,
+        linkCol: 7,
+        existing: courseLink,
+        placeholderKey: "{{CourseCompletionID}}",
+        qrLeft: 62,
+        qrTop: 90,
+        qrSize: 70
+      }
+    ];
+
+    certs.forEach(cert => {
+      if (cert.existing && cert.existing.toString().startsWith("https://")) {
+        Logger.log(`⏩ Skipping ${cert.type} for ${name}`);
+        return;
+      }
+
+      try {
+        const templateFile = DriveApp.getFileById(cert.template);
+        const copy = templateFile.makeCopy(`${cert.type}_${cert.id}`);
+        const copyId = copy.getId();
+        const presentation = SlidesApp.openById(copyId);
+        const slides = presentation.getSlides();
+
+        slides.forEach(slide => {
+          slide.replaceAllText("{{Name}}", name);
+          slide.replaceAllText("{{Course}}", course);
+          slide.replaceAllText("{{IssueDate}}", issueDate);
+          slide.replaceAllText(cert.placeholderKey, cert.id);
+        });
+
+        // QR Code URL (verification)
+        const verifyLink =
+          `https://www.glowlogics.in/certificate-verification?id=${encodeURIComponent(cert.id)}`;
+
+        const qrURL =
+          `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(verifyLink)}`;
+
+        const qrBlob = UrlFetchApp.fetch(qrURL).getBlob();
+
+        // Detect QR Placeholder
+        let placeholder = null;
+
+        slides[0].getPageElements().forEach(el => {
+          try {
+            if (typeof el.getAltDescription === "function") {
+              const alt = el.getAltDescription()?.trim().toUpperCase();
+              if (alt === "QR_PLACEHOLDER") placeholder = el;
+            }
+          } catch (e) { }
+        });
+
+        if (placeholder) {
+          slides[0].insertImage(qrBlob)
+            .setLeft(placeholder.getLeft())
+            .setTop(placeholder.getTop())
+            .setWidth(placeholder.getWidth())
+            .setHeight(placeholder.getHeight());
+          placeholder.remove();
+          Logger.log(`✅ QR placed using placeholder for ${cert.type}`);
+        } else {
+          slides[0].insertImage(qrBlob)
+            .setLeft(cert.qrLeft)
+            .setTop(cert.qrTop)
+            .setWidth(cert.qrSize)
+            .setHeight(cert.qrSize);
+          Logger.log(`⚠️ Fallback QR position used for ${cert.type}`);
+        }
+
+        presentation.saveAndClose();
+
+        const pdfBlob = copy.getAs("application/pdf").setName(`${cert.type}_${name}.pdf`);
+        const pdfFile = folder.createFile(pdfBlob);
+        pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+        const publicURL = pdfFile.getUrl();
+        sheet.getRange(i + 1, cert.linkCol).setValue(publicURL);
+
+        sheet.getRange(i + 1, 11).setValue("Generated");
+
+        DriveApp.getFileById(copyId).setTrashed(true);
+
+      } catch (err) {
+        Logger.log(`❌ ERROR generating ${cert.type} for ${name}: ${err.message}`);
+      }
+    });
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("✔ All Certificates Generated!", "Glowlogics", 5);
+}
+
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////////////////
+
+
+
+function sendCertificateEmails() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+  const data = sheet.getDataRange().getValues();
+
+  Logger.log("📨 Sending emails...");
+
+  for (let i = 1; i < data.length; i++) {
+    const internshipId = data[i][0];
+    const courseId = data[i][1];
+    const name = data[i][2];
+    const course = data[i][3];
+    const internshipLink = data[i][5];
+    const courseLink = data[i][6];
+    const email = data[i][8];
+    const status = (data[i][10] || "").toString().toLowerCase();
+
+    if (!email || status.includes("email sent")) continue;
+
+    let linksHTML = "";
+
+    if (internshipLink)
+      linksHTML += `<p><b>Internship Certificate:</b> <a href="${internshipLink}" target="_blank">Download</a></p>`;
+
+    if (courseLink)
+      linksHTML += `<p><b>Course Completion Certificate:</b> <a href="${courseLink}" target="_blank">Download</a></p>`;
+
+    const subject = `Your Certificates from Glowlogics`;
+    const body = `
+      <p>Dear <b>${name}</b>,</p>
+
+      <p>Congratulations on successfully completing your Internship and Course at <b>Glowlogics Solutions</b>!</p>
+            <p>Your dedication, consistent effort, and enthusiasm throughout this journey have truly stood out. We’ve been impressed with your commitment to learning, your ability to adapt to real-world challenges, and your passion for growth.</b>!</p>
+
+       <p>This internship marks a significant milestone in your professional journey, and we’re confident that the skills and experience you’ve gained at Glowlogics will serve as a strong foundation for your future endeavors.</b>!</p>
+
+       <p>We wish you continued success and look forward to seeing you achieve great things ahead. Remember, this isn’t a goodbye once a part of the Glowlogics family, always a part of it. </b>!</p>
+
+       </p> <p>We encourage you to share your certificate on <b>LinkedIn</b> or other professional platforms, tag <b>Glowlogics Solutions</b>, </p>
+
+
+
+      ${linksHTML}
+
+      <p>You can verify your certificates using these IDs:</p>
+      <ul>
+        <li><b>Internship ID:</b> ${internshipId}</li>
+        <li><b>Course Completion ID:</b> ${courseId}</li>
+      </ul>
+
+      <p>Verification page:
+      <a href="https://www.glowlogics.in/certificate-verification" target="_blank">
+        www.glowlogics.in/certificate-verification
+      </a></p>
+
+      <br>
+      <p>Warm regards,<br><b>Glowlogics Solutions Team</b></p>
+      <p>Helpdesk: 7760750823 | help@glowlogics.in</p>
+    `;
+
+    try {
+      GmailApp.sendEmail(email, subject, "", { htmlBody: body });
+      sheet.getRange(i + 1, 11).setValue("Email Sent ✅");
+      Logger.log(`📧 Email Sent → ${email}`);
+
+    } catch (err) {
+      sheet.getRange(i + 1, 11).setValue("Email Failed ⚠️");
+      Logger.log(`❌ Email Failed for ${name}: ${err.message}`);
+    }
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("📩 All Emails Sent!", "Glowlogics Mailer", 5);
+}

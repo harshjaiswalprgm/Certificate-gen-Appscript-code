@@ -1,0 +1,162 @@
+function generateAmbassadorCertificates() {
+  const templateId = "1EH3PHuKiiDn67eE00UnHHUzF3p465nu8HpDG28oC07I";  // replace if needed
+  const folderId = "1sGoSpQEjSuaxSGp4pLn19RfGJlr5t7v4";  // replace if needed
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName("Ambassador");
+
+  // If the sheet doesn't exist, create it and add headers
+  if (!sheet) {
+    sheet = ss.insertSheet("Ambassador");
+    sheet.getRange(1, 1, 1, 5).setValues([["Name", "College", "Date", "CertificateLink", "Email"]]);
+    Logger.log("Created sheet 'Ambassador' with headers. Add rows and re-run.");
+    SpreadsheetApp.getUi().alert("Created sheet 'Ambassador'. Please add data rows (Name, College, Date) and run the script again.");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log("No data rows found in 'Ambassador' (only header or empty). Add rows and re-run.");
+    return;
+  }
+
+  // Read exactly 5 columns: A:E
+  const data = sheet.getRange(1, 1, lastRow, 5).getValues();
+
+  Logger.log("🎓 Starting Campus Ambassador Certificate generation... rows=" + (data.length - 1));
+
+  const folder = DriveApp.getFolderById(folderId);
+  const templateFile = DriveApp.getFileById(templateId);
+
+  for (let i = 1; i < data.length; i++) { // start at 1 to skip header
+    const row = data[i];
+
+    const name = row[0]?.toString().trim();
+    const college = row[1]?.toString().trim();
+    const dateRaw = row[2];
+    const existingLink = row[3];
+    const email = row[4];
+
+    // Skip if certificate already generated
+    if (existingLink && existingLink.toString().startsWith("https://")) {
+      Logger.log(`⏩ Row ${i + 1}: Skipping (already generated) ${name}`);
+      continue;
+    }
+
+    if (!name || !college || !dateRaw) {
+      Logger.log(`⚠️ Row ${i + 1}: Missing required fields — Name:${!!name} College:${!!college} Date:${!!dateRaw}`);
+      continue;
+    }
+
+    const date = dateRaw instanceof Date
+      ? Utilities.formatDate(dateRaw, Session.getScriptTimeZone(), "dd MMM yyyy")
+      : dateRaw.toString();
+
+    try {
+      // Copy template and replace placeholders
+      const copy = templateFile.makeCopy(`Ambassador_${name}_${new Date().getTime()}`);
+      const copyId = copy.getId();
+      const presentation = SlidesApp.openById(copyId);
+
+      presentation.getSlides().forEach(slide => {
+        slide.replaceAllText("{{Name}}", name);
+        slide.replaceAllText("{{College}}", college);
+        slide.replaceAllText("{{Date}}", date);
+      });
+
+      presentation.saveAndClose();
+
+      // Convert to PDF and move to folder
+      const pdfBlob = copy.getAs("application/pdf").setName(`Ambassador_${name}.pdf`);
+      const pdfFile = folder.createFile(pdfBlob);
+      pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+      const publicURL = pdfFile.getUrl();
+
+      // Write back the public URL into column D for this row
+      sheet.getRange(i + 1, 4).setValue(publicURL);
+
+      // Optionally write timestamp or status in column F (if you want)
+      // sheet.getRange(i + 1, 6).setValue("Generated " + new Date());
+
+      Logger.log(`✅ Row ${i + 1}: Generated Ambassador certificate for ${name} → ${publicURL}`);
+
+      // NOTE: Do NOT trash the copy immediately — leaving it avoids Drive "in bin" preview issues.
+      // If you want to clean up copies later, run a separate cleanup script that moves old copies to trash after verifying PDFs.
+
+    } catch (err) {
+      Logger.log(`❌ Row ${i + 1}: ERROR generating for ${name} → ${err.message}`);
+      // Optionally write error status to sheet column E or F
+      // sheet.getRange(i + 1, 6).setValue("Error: " + err.message);
+    }
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("🎉 Ambassador generation finished", "Glowlogics", 5);
+}
+
+
+/**
+ * Sends ambassador certificate emails.
+ * Expects columns: Name (A), College (B), Date (C), CertificateLink (D), Email (E)
+ */
+function sendAmbassadorEmails() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("Ambassador");
+  if (!sheet) {
+    Logger.log("Sheet 'Ambassador' not found. Nothing to send.");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log("No ambassador rows to process.");
+    return;
+  }
+
+  const data = sheet.getRange(1, 1, lastRow, 5).getValues();
+
+  Logger.log("📨 Sending Ambassador emails... rows=" + (data.length - 1));
+
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const name = row[0];
+    const college = row[1];
+    const date = row[2];
+    const link = row[3];
+    const email = row[4];
+
+    if (!email) {
+      Logger.log(`⚠️ Row ${i + 1}: No email for ${name}, skipping.`);
+      continue;
+    }
+    if (!link || !link.toString().startsWith("https://")) {
+      Logger.log(`⚠️ Row ${i + 1}: No valid certificate link for ${name}, skipping email.`);
+      continue;
+    }
+
+    const subject = `Your Campus Ambassador Certificate - Glowlogics`;
+    const body = `
+      <p>Dear <b>${name}</b>,</p>
+      <p>Congratulations! You have been recognized as a <b>Campus Ambassador</b> for Glowlogics.</p>
+       </p> <p>We encourage you to share your certificate on <b>LinkedIn</b> or other professional platforms, tag <b>Glowlogics Solutions</b>, </p>
+      <p><b>College:</b> ${college}</p>
+      <p><b>Date:</b> ${date}</p>
+      <p>You can download your certificate here:<br><a href="${link}" target="_blank">${link}</a></p>
+      <br><p>Warm Regards,<br><b>Glowlogics Team</b></p>
+    `;
+
+    try {
+      GmailApp.sendEmail(email, subject, "", { htmlBody: body });
+      Logger.log(`📧 Row ${i + 1}: Email sent to ${email}`);
+
+      // Optionally mark status in column F
+      // sheet.getRange(i + 1, 6).setValue("Email Sent " + new Date());
+    } catch (err) {
+      Logger.log(`❌ Row ${i + 1}: Failed to send email to ${email} → ${err.message}`);
+      // Optionally write failure in sheet
+      // sheet.getRange(i + 1, 6).setValue("Email Failed: " + err.message);
+    }
+  }
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("📩 Ambassador emails processed", "Glowlogics", 5);
+}
